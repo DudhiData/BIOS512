@@ -1,0 +1,202 @@
+---
+title: "Phishing Website Detection"
+output: html_document
+---
+
+Libraries
+
+```{r}
+library(glmnet)
+library(tidyverse)
+library(FactoMineR)
+library(Rtsne)
+```
+
+glmnet: elastic net logistic regression model
+
+FactoMineR: PCA-like breakdown of features but for datasets of mixed data types like binary variables and numeric variables
+
+-   Have to use this instead of the basic PCA because:
+
+    -   Difficult to define a continuous, linear space between the discrete\
+        values of the binary variables of principal components
+
+    -   Disproportionate effects of binary vs. numeric variables on variance
+
+Rtsne: our way of embedding our higher dimensional structure from FAMD into a 2-dimensional space
+
+```{r}
+phish <- read_csv('~/project1/source_data/PhiUSIIL_Phishing_URL_Dataset.csv') %>% select(-FILENAME,-Title,-TLD,-URL, -Domain) %>%
+  rename('SpecialCharRatioInURL' = 'SpacialCharRatioInURL')
+binary_columns <- c('IsDomainIP', 'HasObfuscation', 'IsHTTPS', 'HasTitle', 'HasFavicon', 'IsResponsive', 'HasDescription', 'HasExternalFormSubmit', 'HasSocialNet', 'HasSubmitButton', 'HasHiddenFields', 'HasPasswordField', 'Bank', 'Pay', 'Crypto', 'HasCopyrightInfo', 'Robots')
+```
+
+First, we load our dataset which has 53 features and 1 label column with around 240,000 observations. We don't need the filename, and we can't really calculate the features of a given URL for a said input anyways since there are already pre-derived features in the dataset. Thus, we don't really need to keep the title, TLD, URL, and domain since the information about them is already encapsulated in the other features.
+
+Then, we store the names of the binary variables for future use.
+
+```{r}
+train <- runif(nrow(phish)) < 0.5
+test <- !train;
+
+train_df <- phish %>% filter(train)
+test_df <- phish %>% filter(test)
+
+train_df[binary_columns] <- lapply(train_df[binary_columns], factor)
+test_df[binary_columns]  <- lapply(test_df[binary_columns], factor)
+
+y_train <- as.numeric(as.character(train_df$label))
+y_test  <- as.numeric(as.character(test_df$label))
+
+x_train_raw <- train_df %>% select(-label)
+x_test_raw  <- test_df  %>% select(-label)
+
+common_cols <- intersect(names(x_train_raw), names(x_test_raw))
+
+for (col in common_cols) {
+  if (is.factor(x_train_raw[[col]])) {
+    x_test_raw[[col]] <- factor(
+      x_test_raw[[col]],
+      levels = levels(x_train_raw[[col]])
+    )
+  }
+}
+
+x_test_raw <- x_test_raw[, names(x_train_raw)]
+```
+
+In this snippet of code, we create our train and test sets and ensure the factor levels are identical to prevent matching issues during the FAMD process (e.g. common_cols).
+
+```{r}
+famd_model <- FAMD(x_train_raw, ncp = 20, graph = FALSE)
+
+ncp_actual <- ncol(famd_model$ind$coord)
+
+x_train <- as.matrix(famd_model$ind$coord[, 1:ncp_actual])
+
+x_test <- as.matrix(predict(famd_model, x_test_raw)$coord)
+
+cv_model <- cv.glmnet(x_train, y_train, family="binomial", alpha=0.5, nfolds = 5)
+
+plot(cv_model)
+
+fit <- cv_model$glmnet.fit
+
+best_fit <- glmnet(x_train,y_train,lambda=cv_model$lambda.min)
+best_fit$beta
+```
+
+Then, we use FAMD in a PCA-like fashion to reduce the total number of dimensions needed to explain the variance in the dataset to around 20 (, so our hardware can actually run the model.
+
+The plot above graphs binomial deviance (essentially a goodness of fit measure for binary outcome models) against -log(lambda). When -log(lambda) increases our lambda.min is decreasing alongside our binomial deviance which means our model is performing as expected for a regularization logistic regression.
+
+```{r}
+probs_test <- as.vector(predict(cv_model, newx = x_test, s = "lambda.min", type = "response"))
+test_df <- test_df %>% mutate(phishing_prediction = probs_test)
+
+p <- test_df$phishing_prediction
+
+deviance_resid <- ifelse(y_test == 1,
+                         sqrt(-2 * log(p)),
+                         -sqrt(-2 * log(1 - p))) # different way to look at residuals for model
+
+ggplot(test_df, aes(x = deviance_resid)) +
+  geom_density()
+
+coef(cv_model, s = 'lambda.min')
+train_pred <- predict(cv_model, newx=x_train, s='lambda.min', type = 'response')
+test_pred <- predict(cv_model, newx=x_test, s='lambda.min', type='response')
+train_pred_class <- ifelse(train_pred > 0.5, 1, 0)
+test_pred_class <- ifelse(test_pred > 0.5, 1, 0)
+train_acc <- mean(train_pred_class == y_train)
+test_acc <- mean(test_pred_class == y_test)
+
+roc_curve_data <- function(model, x_data, y_actual, thresholds = seq(0, 1, length.out = 101)) {
+  probs <- predict(model, newx = x_data, s = "lambda.min", type = "response")[,1]
+
+  tpr <- numeric(length(thresholds)) 
+  fpr <- numeric(length(thresholds)) 
+
+  for(i in seq_along(thresholds)) {
+    predicted_class <- ifelse(probs >= thresholds[i], 1, 0)
+
+    tp <- sum(predicted_class == 1 & y_actual == 1)
+    fp <- sum(predicted_class == 1 & y_actual == 0)
+    tn <- sum(predicted_class == 0 & y_actual == 0)
+    fn <- sum(predicted_class == 0 & y_actual == 1)
+
+    tpr[i] <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)  
+    fpr[i] <- ifelse((fp + tn) > 0, fp / (fp + tn), 0)  
+  }
+
+  tibble(
+    threshold = thresholds,
+    fpr = fpr,  
+    tpr = tpr   
+  )
+}
+
+roc_data <- roc_curve_data(cv_model, x_test, y_test)
+
+ggplot(roc_data, aes(x = fpr, y = tpr)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(
+    title = "ROC Curve for Cross-Validated Model",
+    x = "False Positive Rate",
+    y = "True Positive Rate"
+  ) +
+  theme_minimal() +
+  xlim(0, 1) +
+  ylim(0, 1)
+
+roc_sorted <- roc_data %>% arrange(fpr)
+
+auc_value <- sum(diff(roc_sorted$fpr) *
+                   (head(roc_sorted$tpr, -1) + tail(roc_sorted$tpr, -1)) / 2)
+
+cat("AUC (approximate):", abs(auc_value), "\n")
+cat("Training Accuracy:", train_acc, "\n")
+cat("Testing Accuracy:", test_acc, "\n")
+
+```
+
+In this chunk of code we do 2 things, first, calculate and plot the deviance residuals (generally better for logistic regressions) of our prediction on the test split. Then, we calculate our test and train accuracies on their respective predictions. Finally, we calculate our false and true positives and negatives to plot our ROC curve and get the AUC.
+
+The plots above graphs deviance residuals (essentially residuals but for logistic likelihoods), and it's showing us that the model is predicting really well, with a majority of the predictions ending, which is a tad bit concerning when looking at the training vs testing accuracies consistenly coming out to be testing \> training. It suggests that either the data is highly separable, or data leakage occurred from the training to the test somewhere in the analysis.
+
+The ROC curve also points toward this conundrum, the AUC comes out to be nearly equal to one most times.
+
+```{r}
+var_dim <- famd_model$eig %>% as.data.frame() %>% rownames_to_column("Component") %>% 
+  rename(
+    Eigenvalue = eigenvalue,
+    Variance = `percentage of variance`,
+    Cumulative = `cumulative percentage of variance`
+  )
+
+var_dim$Component <- as.numeric(gsub("comp ", "", var_dim$Component))
+
+ggplot(var_dim, aes(Component, Variance)) + geom_line(linewidth = 1) + geom_point(size = 2) + labs(title = 'FAMD Variance Scree Plot')
+
+
+famd_coords <- famd_model$ind$coord[, 1:ncp_actual]
+dup_idx <- duplicated(famd_coords)
+famd_coords_unique <- famd_coords[!dup_idx, ]
+y_train_unique <- y_train[!dup_idx]
+sample_idx <- sample(1:nrow(famd_coords_unique), min(10000, nrow(famd_coords_unique)))
+famd_sample <- famd_coords_unique[sample_idx, ]
+y_sample <- y_train_unique[sample_idx]
+tsne_famd <- Rtsne(famd_sample, dims = 2, perplexity = 30, verbose = FALSE, check_duplicates=FALSE, max_iter=300)
+tsne_df <- as.data.frame(tsne_famd$Y) %>% mutate(class = y_sample)
+colnames(tsne_df) <- c('Dimension_1', 'Dimension_2','class')
+
+ggplot(tsne_df, aes(x=Dimension_1, y=Dimension_2, color = factor(class))) + geom_point(alpha = 0.7)
+famd_model$eig
+```
+
+Finally, we use the PCA-like dimensions from the FAMD model and using the eigenvalue and variance table given through famd_model\$eig, we can see the percentage of variance each extra dimension explains. Breaking down y_test and the famd_coords for each dimension, we can input it into Rtsne to embed the higher dimensional structure of our 20-dimensional output from FAMD into a lower dimensional 2D structure.
+
+For these graphs, the scree plot is simply meant to visualize how much extra variance each new dimension will explain. The second plot is the 2-dimensional embedding of our higher-dimensional FAMD output. The main thing this tells us is that our data does seem to be highly separable just by the use of 2 our dimensions that only explain around \~28% of the variance in the dataset. You could potentially use plotly and embed into 3D and explain around 33% of the variance.
+
+Conclusion: The phishing dataset was probably a very separable dataset due to the pre-derived features based on the academic paper that was used to create the dataset. However, the elastic net logistic regression model was very good at separating the data based on a lower-dimensional embedding than that of the original dataset's total number of features. The main limitation being that this probably wouldn't have any practical usage outside of this dataset unless you were to find the algorithm that was used to calculate the pre-derived features and use it to calculate the features for each new URL you put in as input to predict whether it was a phishing URL or not.
