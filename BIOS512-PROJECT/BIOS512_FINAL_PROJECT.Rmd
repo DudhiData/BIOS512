@@ -86,7 +86,7 @@ best_fit <- glmnet(x_train,y_train,lambda=cv_model$lambda.min)
 best_fit$beta
 ```
 
-Then, we use FAMD in a PCA-like fashion to reduce the total number of dimensions needed to explain the variance in the dataset to around 20 (, so our hardware can actually run the model.
+Then, we use FAMD in a PCA-like fashion to reduce the total number of dimensions needed to explain the variance in the dataset to around 20, so our hardware can actually run the model.
 
 The plot above graphs binomial deviance (essentially a goodness of fit measure for binary outcome models) against -log(lambda). When -log(lambda) increases our lambda.min is decreasing alongside our binomial deviance which means our model is performing as expected for a regularization logistic regression.
 
